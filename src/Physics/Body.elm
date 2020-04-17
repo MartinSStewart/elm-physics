@@ -1,11 +1,12 @@
 module Physics.Body exposing
     ( Body, block, plane, sphere, particle
     , Behavior, dynamic, static, withBehavior
-    , frame, originPoint, velocity, angularVelocity, centerOfMass
+    , frame, originPoint, velocity, angularVelocity, velocityAt, centerOfMass, mass
     , moveTo, translateBy, rotateAround
     , data, withData
     , applyForce, applyImpulse
     , withMaterial, compound, withDamping
+    , inertia, placeIn
     )
 
 {-|
@@ -20,7 +21,7 @@ module Physics.Body exposing
 
 ## Properties
 
-@docs frame, originPoint, velocity, angularVelocity, centerOfMass
+@docs frame, originPoint, velocity, angularVelocity, velocityAt, centerOfMass, mass
 
 
 ## Position and orientation
@@ -169,14 +170,14 @@ other dynamic and static bodies.
 dynamic : Mass -> Behavior
 dynamic kilos =
     let
-        mass =
+        bodyMass =
             Mass.inKilograms kilos
     in
-    if isNaN mass || isInfinite mass || mass <= 0 then
+    if isNaN bodyMass || isInfinite bodyMass || bodyMass <= 0 then
         Static
 
     else
-        Dynamic mass
+        Dynamic bodyMass
 
 
 {-| Static bodies don’t move and only collide with dynamic bodies.
@@ -196,7 +197,7 @@ static =
 withBehavior : Behavior -> Body data -> Body data
 withBehavior behavior (Protected body) =
     case behavior of
-        Dynamic mass ->
+        Dynamic bodyMass ->
             case body.shapes of
                 [] ->
                     Protected body
@@ -207,10 +208,10 @@ withBehavior behavior (Protected body) =
                             Protected body
 
                         _ ->
-                            Protected (Internal.updateMassProperties { body | mass = mass })
+                            Protected (Internal.updateMassProperties { body | mass = bodyMass })
 
                 _ ->
-                    Protected (Internal.updateMassProperties { body | mass = mass })
+                    Protected (Internal.updateMassProperties { body | mass = bodyMass })
 
         Static ->
             Protected (Internal.updateMassProperties { body | mass = 0 })
@@ -268,11 +269,48 @@ angularVelocity (Protected body) =
     Vector3d.unsafe body.angularVelocity
 
 
+{-| Get the linear velocity of a point on a body.
+
+This takes into account both linear and angular velocities of the body.
+
+-}
+velocityAt : Point3d Meters WorldCoordinates -> Body data -> Vector3d MetersPerSecond WorldCoordinates
+velocityAt point (Protected body) =
+    let
+        origin =
+            Transform3d.originPoint body.transform3d
+
+        { x, y, z } =
+            Point3d.toMeters point
+
+        originToPoint =
+            { x = x - origin.x
+            , y = y - origin.y
+            , z = z - origin.z
+            }
+
+        cross =
+            Vec3.cross body.angularVelocity originToPoint
+    in
+    Vector3d.unsafe (Vec3.add cross body.velocity)
+
+
 {-| Get the center of mass of a body in the body coordinate system.
 -}
 centerOfMass : Body data -> Point3d Meters BodyCoordinates
 centerOfMass (Protected { centerOfMassTransform3d }) =
     Point3d.fromMeters (Transform3d.originPoint centerOfMassTransform3d)
+
+
+{-| Get a mass of a body. Returns Nothing if a body is not dynamic.
+-}
+mass : Body data -> Maybe Mass
+mass (Protected body) =
+    if body.mass <= 0 then
+        Nothing
+
+    else
+        Just (Mass.kilograms body.mass)
 
 
 {-| Set the position of the body in the world,
@@ -378,6 +416,51 @@ rotateAround axis angle (Protected body) =
         }
 
 
+placeIn : Frame3d Meters WorldCoordinates { defines : BodyCoordinates } -> Body data -> Body data
+placeIn frame3d (Protected body) =
+    let
+        bodyCoordinatesTransform3d =
+            Transform3d.placeIn
+                body.transform3d
+                (Transform3d.inverse body.centerOfMassTransform3d)
+
+        rightHandedFrame3d =
+            if Frame3d.isRightHanded frame3d then
+                frame3d
+
+            else
+                Frame3d.reverseZ frame3d
+
+        origin =
+            Point3d.unwrap (Frame3d.originPoint rightHandedFrame3d)
+
+        x =
+            Direction3d.unwrap (Frame3d.xDirection rightHandedFrame3d)
+
+        y =
+            Direction3d.unwrap (Frame3d.yDirection rightHandedFrame3d)
+
+        z =
+            Direction3d.unwrap (Frame3d.zDirection rightHandedFrame3d)
+
+        transform =
+            Transform3d.fromOriginAndBasis origin x y z
+
+        newTransform3d =
+            Transform3d.placeIn
+                (Transform3d.placeIn
+                    transform
+                    bodyCoordinatesTransform3d
+                )
+                body.centerOfMassTransform3d
+    in
+    Protected
+        { body
+            | transform3d = newTransform3d
+            , worldShapes = InternalShape.shapesPlaceIn newTransform3d body.shapes
+        }
+
+
 {-| Update user-defined data.
 -}
 withData : data -> Body data -> Body data
@@ -453,6 +536,19 @@ applyImpulse (Quantity impulse) direction point (Protected body) =
 
     else
         Protected body
+
+
+inertia : Body data -> Vector3d units WorldCoordinates -> Vector3d units WorldCoordinates
+inertia (Protected { invInertiaWorld }) vec =
+    let
+        { x, y, z } =
+            Vector3d.unwrap vec
+    in
+    Vector3d.unsafe
+        { x = invInertiaWorld.m11 * x + invInertiaWorld.m12 * y + invInertiaWorld.m13 * z
+        , y = invInertiaWorld.m21 * x + invInertiaWorld.m22 * y + invInertiaWorld.m23 * z
+        , z = invInertiaWorld.m31 * x + invInertiaWorld.m32 * y + invInertiaWorld.m33 * z
+        }
 
 
 {-| Set the [material](Physics-Material) to controll friction and bounciness.
